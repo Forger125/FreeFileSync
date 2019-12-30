@@ -95,6 +95,7 @@ CPP_FILES+=../../zen/file_traverser.cpp
 CPP_FILES+=../../zen/http.cpp
 CPP_FILES+=../../zen/zstring.cpp
 CPP_FILES+=../../zen/format_unit.cpp
+CPP_FILES+=../../zen/open_ssl.cpp
 CPP_FILES+=../../zen/process_priority.cpp
 CPP_FILES+=../../zen/shutdown.cpp
 CPP_FILES+=../../zen/thread.cpp
