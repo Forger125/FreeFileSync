@@ -11,8 +11,13 @@
 #include <zen/sys_error.h>
 
 
-namespace zen //init OpenSSL before use!
+namespace zen
 {
+//init OpenSSL before use!
+void openSslInit();
+void openSslTearDown();
+
+
 enum class RsaStreamType
 {
     pkix,  //base-64-encoded SubjectPublicKeyInfo structure ("BEGIN PUBLIC KEY")
