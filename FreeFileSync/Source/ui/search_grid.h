@@ -4,14 +4,16 @@
 // * Copyright (C) Zenju (zenju AT freefilesync DOT org) - All Rights Reserved *
 // *****************************************************************************
 
-#ifndef LEGACY_COMPILER_H_839567308565656789
-#define LEGACY_COMPILER_H_839567308565656789
+#ifndef SEARCH_H_423905762345342526587
+#define SEARCH_H_423905762345342526587
 
-namespace std
+#include <wx+/grid.h>
+
+
+namespace fff
 {
-//https://gcc.gnu.org/onlinedocs/libstdc++/manual/status.html
-//https://isocpp.org/std/standing-documents/sd-6-sg10-feature-test-recommendations
-
+std::pair<const zen::Grid*, ptrdiff_t> findGridMatch(const zen::Grid& grid1, const zen::Grid& grid2, const std::wstring& searchString, bool respectCase, bool searchAscending);
+//returns (grid/row) where the value was found, (nullptr, -1) if not found
 }
 
-#endif //LEGACY_COMPILER_H_839567308565656789
+#endif //SEARCH_H_423905762345342526587
