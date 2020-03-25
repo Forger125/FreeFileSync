@@ -8,20 +8,25 @@
 #include <memory>
 #include <zen/file_access.h>
 #include <zen/perf.h>
+#include <zen/shutdown.h>
 #include <wx/tooltip.h>
 #include <wx/log.h>
 #include <wx+/app_main.h>
 #include <wx+/popup_dlg.h>
 #include <wx+/image_resources.h>
-#include "comparison.h"
-#include "algorithm.h"
-#include "synchronization.h"
+#include <wx/msgdlg.h>
+#include "afs/concrete.h"
+#include "base/algorithm.h"
+#include "base/comparison.h"
+#include "base/resolve_path.h"
+#include "base/synchronization.h"
 #include "ui/batch_status_handler.h"
 #include "ui/main_dlg.h"
-#include "lib/help_provider.h"
-#include "lib/process_xml.h"
-#include "lib/error_log.h"
-#include "lib/resolve_path.h"
+#include "base_tools.h"
+#include "config.h"
+#include "help_provider.h"
+#include "fatal_error.h"
+#include "log_file.h"
 
     #include <gtk/gtk.h>
 
@@ -49,14 +54,50 @@ const wxEventType EVENT_ENTER_EVENT_LOOP = wxNewEventType();
 
 //##################################################################################################################
 
-
 bool Application::OnInit()
 {
     //do not call wxApp::OnInit() to avoid using wxWidgets command line parser
 
-    ::gtk_init(nullptr, nullptr);
-    //::gtk_rc_parse((getResourceDirPf() + "styles.gtk_rc").c_str()); //remove inner border from bitmap buttons
-    //=> looks bad on Suse Linux!
+    //GTK should already have been initialized by wxWidgets (see \src\gtk\app.cpp:wxApp::Initialize)
+#if GTK_MAJOR_VERSION == 2
+    ::gtk_rc_parse((getResourceDirPf() + "Gtk2Styles.rc").c_str());
+
+    //hang on Ubuntu 19.10 (GLib 2.62) caused by ibus initialization: https://freefilesync.org/forum/viewtopic.php?t=6704
+    //=> work around 1: bonus: avoid needless DBus calls: https://developer.gnome.org/gio/stable/running-gio-apps.html
+    //                  drawback: missing MTP and network links in folder picker: https://freefilesync.org/forum/viewtopic.php?t=6871
+    //if (::setenv("GIO_USE_VFS", "local", true /*overwrite*/) != 0)
+    //    std::cerr << utfTo<std::string>(formatSystemError(L"setenv(GIO_USE_VFS)", errno)) << "\n";
+    //
+    //=> work around 2:
+    g_vfs_get_default(); //returns unowned GVfs*
+    //no such issue on GTK3!
+
+#elif GTK_MAJOR_VERSION == 3
+    try
+    {
+        GtkCssProvider* provider = ::gtk_css_provider_new ();
+        ZEN_ON_SCOPE_EXIT(::g_object_unref(provider));
+
+        GError* error = nullptr;
+        ZEN_ON_SCOPE_EXIT(if (error) ::g_error_free(error););
+
+        ::gtk_css_provider_load_from_path(provider, //GtkCssProvider* css_provider,
+                                          (getResourceDirPf() + "Gtk3Styles.css").c_str(), //const gchar* path,
+                                          &error); //GError** error
+        if (error)
+            throw SysError(formatSystemError(L"gtk_css_provider_load_from_data", replaceCpy(_("Error Code %x"), L"%x",
+                                                                                            numberTo<std::wstring>(error->code)),
+                                             utfTo<std::wstring>(error->message)));
+
+        ::gtk_style_context_add_provider_for_screen(::gdk_screen_get_default(),               //GdkScreen* screen,
+                                                    GTK_STYLE_PROVIDER(provider),             //GtkStyleProvider* provider,
+                                                    GTK_STYLE_PROVIDER_PRIORITY_APPLICATION); //guint priority
+    }
+    catch (const SysError& e) { std::cerr << utfTo<std::string>(e.toString()) << '\n'; }
+#else
+#error unknown GTK version!
+#endif
+
 
     //Windows User Experience Interaction Guidelines: tool tips should have 5s timeout, info tips no timeout => compromise:
     wxToolTip::Enable(true); //yawn, a wxWidgets screw-up: wxToolTip::SetAutoPop is no-op if global tooltip window is not yet constructed: wxToolTip::Enable creates it
@@ -64,18 +105,20 @@ bool Application::OnInit()
 
     SetAppName(L"FreeFileSync"); //if not set, the default is the executable's name!
 
-    initResourceImages(getResourceDirPf() + Zstr("Resources.zip")); //parallel xBRZ-scaling! => run as early as possible
+    initResourceImages(getResourceDirPf() + Zstr("Icons.zip")); //parallel xBRZ-scaling! => run as early as possible
 
     try
     {
         //tentatively set program language to OS default until GlobalSettings.xml is read later
         setLanguage(XmlGlobalSettings().programLanguage); //throw FileError
     }
-    catch (const FileError&) { assert(false); }
+    catch (FileError&) { assert(false); }
+
+    initAfs({ getResourceDirPf(), getConfigDirPathPf() }); //bonus: using FTP Gdrive implicitly inits OpenSSL (used in runSanityChecks() on Linux) alredy during globals init
 
 
-    Connect(wxEVT_QUERY_END_SESSION, wxEventHandler(Application::onQueryEndSession), nullptr, this);
-    Connect(wxEVT_END_SESSION,       wxEventHandler(Application::onQueryEndSession), nullptr, this);
+    Connect(wxEVT_QUERY_END_SESSION, wxEventHandler(Application::onQueryEndSession), nullptr, this); //can veto
+    Connect(wxEVT_END_SESSION,       wxEventHandler(Application::onQueryEndSession), nullptr, this); //can *not* veto
 
     //Note: app start is deferred: batch mode requires the wxApp eventhandler to be established for UI update events. This is not the case at the time of OnInit()!
     Connect(EVENT_ENTER_EVENT_LOOP, wxEventHandler(Application::onEnterEventLoop), nullptr, this);
@@ -86,11 +129,14 @@ bool Application::OnInit()
 
 int Application::OnExit()
 {
-    uninitializeHelp();
     releaseWxLocale();
     cleanupResourceImages();
+    teardownAfs();
     return wxApp::OnExit();
 }
+
+
+wxLayoutDirection Application::GetLayoutDirection() const { return getLayoutDirection(); }
 
 
 void Application::onEnterEventLoop(wxEvent& event)
@@ -115,8 +161,8 @@ int Application::OnRun()
     {
         logFatalError(e.what()); //it's not always possible to display a message box, e.g. corrupted stack, however low-level file output works!
 
-        const auto title = copyStringTo<std::wstring>(wxTheApp->GetAppDisplayName()) + SPACED_DASH + _("An exception occurred");
-        wxSafeShowMessage(title, e.what());
+        const auto titleFmt = copyStringTo<std::wstring>(wxTheApp->GetAppDisplayName()) + SPACED_DASH + _("An exception occurred");
+        std::cerr << utfTo<std::string>(titleFmt + SPACED_DASH) << e.what() << '\n';
         return FFS_RC_EXCEPTION;
     }
     //catch (...) -> let it crash and create mini dump!!!
@@ -130,7 +176,8 @@ void Application::onQueryEndSession(wxEvent& event)
     if (auto mainWin = dynamic_cast<MainDialog*>(GetTopWindow()))
         mainWin->onQueryEndSession();
     //it's futile to try and clean up while the process is in full swing (CRASH!) => just terminate!
-    std::abort(); //on Windows calls ::ExitProcess() which can still internally process Window messages and crash!
+    //also: avoid wxCloseEvent::Veto() cancelling shutdown when some dialogs receive a close event from the system
+    terminateProcess(FFS_RC_ABORTED);
 }
 
 
@@ -150,10 +197,12 @@ void Application::launch(const std::vector<Zstring>& commandArgs)
     {
         logFatalError(utfTo<std::string>(msg));
 
-        //error handling strategy unknown and no sync log output available at this point! => show message box
+        //error handling strategy unknown and no sync log output available at this point!
         auto titleFmt = copyStringTo<std::wstring>(wxTheApp->GetAppDisplayName()) + SPACED_DASH + title;
-        wxSafeShowMessage(titleFmt, msg);
-
+        std::cerr << utfTo<std::string>(titleFmt + SPACED_DASH + msg) << '\n';
+        //alternative0: std::wcerr: cannot display non-ASCII at all, so why does it exist???
+        //alternative1: wxSafeShowMessage => NO console output on Debian x86, WTF!
+        //alternative2: wxMessageBox() => works, but we probably shouldn't block during command line usage
         raiseReturnCode(returnCode_, FFS_RC_ABORTED);
     };
 
@@ -163,76 +212,45 @@ void Application::launch(const std::vector<Zstring>& commandArgs)
     Zstring globalConfigFile;
     bool openForEdit = false;
     {
-        std::vector<Zstring> dirPathPhrasesLeft;  //TODO: remove migration code at some time! 2017-12-14
-        std::vector<Zstring> dirPathPhrasesRight; //
+        const char* optionEdit    = "-edit";
+        const char* optionDirPair = "-dirpair";
+        const char* optionSendTo  = "-sendto"; //remaining arguments are unspecified number of folder paths; wonky syntax; let's keep it undocumented
 
-        const Zchar optionEdit    [] = Zstr("-edit");
-        const Zchar optionLeftDir [] = Zstr("-leftdir");  //TODO: remove migration code at some time! 2017-12-14
-        const Zchar optionRightDir[] = Zstr("-rightdir"); //
-        const Zchar optionDirPair [] = Zstr("-dirpair");
-        const Zchar optionSendTo  [] = Zstr("-sendto"); //remaining arguments are unspecified number of folder paths; wonky syntax; let's keep it undocumented
-
-        auto syntaxHelpRequested = [&](const Zstring& arg)
+        auto isHelpRequest = [](const Zstring& arg)
         {
-            auto it = std::find_if(arg.begin(), arg.end(), [](Zchar c) { return c != Zchar('/') && c != Zchar('-'); });
+            auto it = std::find_if(arg.begin(), arg.end(), [](Zchar c) { return c != Zstr('/') && c != Zstr('-'); });
             if (it == arg.begin()) return false; //require at least one prefix character
 
             const Zstring argTmp(it, arg.end());
-            return strEqual(argTmp, Zstr("help"), CmpAsciiNoCase()) ||
-                   strEqual(argTmp, Zstr("h"),    CmpAsciiNoCase()) ||
+            return equalAsciiNoCase(argTmp, "help") ||
+                   equalAsciiNoCase(argTmp, "h")    ||
                    argTmp == Zstr("?");
         };
 
         auto isCommandLineOption = [&](const Zstring& arg)
         {
-            return strEqual(arg, optionEdit,     CmpAsciiNoCase()) ||
-                   strEqual(arg, optionLeftDir,  CmpAsciiNoCase()) ||
-                   strEqual(arg, optionRightDir, CmpAsciiNoCase()) ||
-                   strEqual(arg, optionDirPair,  CmpAsciiNoCase()) ||
-                   strEqual(arg, optionSendTo,   CmpAsciiNoCase()) ||
-                   syntaxHelpRequested(arg);
+            return equalAsciiNoCase(arg, optionEdit   ) ||
+                   equalAsciiNoCase(arg, optionDirPair) ||
+                   equalAsciiNoCase(arg, optionSendTo ) ||
+                   isHelpRequest(arg);
         };
 
         for (auto it = commandArgs.begin(); it != commandArgs.end(); ++it)
-            if (syntaxHelpRequested(*it))
+            if (isHelpRequest(*it))
                 return showSyntaxHelp();
-            else if (strEqual(*it, optionEdit, CmpAsciiNoCase()))
+            else if (equalAsciiNoCase(*it, optionEdit))
                 openForEdit = true;
-            else if (strEqual(*it, optionLeftDir, CmpAsciiNoCase()))
+            else if (equalAsciiNoCase(*it, optionDirPair))
             {
                 if (++it == commandArgs.end() || isCommandLineOption(*it))
-                {
-                    notifyFatalError(replaceCpy(_("A directory path is expected after %x."), L"%x", utfTo<std::wstring>(optionLeftDir)), _("Syntax error"));
-                    return;
-                }
-                dirPathPhrasesLeft.push_back(*it);
-            }
-            else if (strEqual(*it, optionRightDir, CmpAsciiNoCase()))
-            {
-                if (++it == commandArgs.end() || isCommandLineOption(*it))
-                {
-                    notifyFatalError(replaceCpy(_("A directory path is expected after %x."), L"%x", utfTo<std::wstring>(optionRightDir)), _("Syntax error"));
-                    return;
-                }
-                dirPathPhrasesRight.push_back(*it);
-            }
-            else if (strEqual(*it, optionDirPair, CmpAsciiNoCase()))
-            {
-                if (++it == commandArgs.end() || isCommandLineOption(*it))
-                {
-                    notifyFatalError(replaceCpy(_("A left and a right directory path are expected after %x."), L"%x", utfTo<std::wstring>(optionDirPair)), _("Syntax error"));
-                    return;
-                }
+                    return notifyFatalError(replaceCpy(_("A left and a right directory path are expected after %x."), L"%x", utfTo<std::wstring>(optionDirPair)), _("Syntax error"));
                 dirPathPhrasePairs.emplace_back(*it, Zstring());
 
                 if (++it == commandArgs.end() || isCommandLineOption(*it))
-                {
-                    notifyFatalError(replaceCpy(_("A left and a right directory path are expected after %x."), L"%x", utfTo<std::wstring>(optionDirPair)), _("Syntax error"));
-                    return;
-                }
+                    return notifyFatalError(replaceCpy(_("A left and a right directory path are expected after %x."), L"%x", utfTo<std::wstring>(optionDirPair)), _("Syntax error"));
                 dirPathPhrasePairs.back().second = *it;
             }
-            else if (strEqual(*it, optionSendTo, CmpAsciiNoCase()))
+            else if (equalAsciiNoCase(*it, optionSendTo))
             {
                 for (size_t i = 0; ; ++i)
                 {
@@ -242,7 +260,7 @@ void Application::launch(const std::vector<Zstring>& commandArgs)
                         break;
                     }
 
-                    if (i < 2) //-SendTo with more than 2 paths? Doesn't make any sense, does it!?
+                    if (i < 2) //else: -SendTo with more than 2 paths? Doesn't make any sense, does it!?
                     {
                         //for -SendTo we expect a list of full native paths, not "phrases" that need to be resolved!
                         auto getFolderPath = [](Zstring itemPath)
@@ -250,7 +268,7 @@ void Application::launch(const std::vector<Zstring>& commandArgs)
                             try
                             {
                                 if (getItemType(itemPath) == ItemType::FILE) //throw FileError
-                                    if (Opt<Zstring> parentPath = getParentFolderPath(itemPath))
+                                    if (std::optional<Zstring> parentPath = getParentFolderPath(itemPath))
                                         return *parentPath;
                             }
                             catch (FileError&) {}
@@ -263,7 +281,7 @@ void Application::launch(const std::vector<Zstring>& commandArgs)
                         else
                         {
                             const Zstring folderPath = getFolderPath(*it);
-                            if (!equalFilePath(dirPathPhrasePairs.back().first, folderPath)) //user accidentally sending to two files, which each time yield the same parent folder
+                            if (dirPathPhrasePairs.back().first != folderPath) //else: user accidentally sending to two files, which each time yield the same parent folder
                                 dirPathPhrasePairs.back().second = folderPath;
                         }
                     }
@@ -282,45 +300,31 @@ void Application::launch(const std::vector<Zstring>& commandArgs)
                     else if (fileAvailable(filePath + Zstr(".xml")))
                         filePath += Zstr(".xml");
                     else
-                    {
-                        notifyFatalError(replaceCpy(_("Cannot find file %x."), L"%x", fmtPath(filePath)), _("Error"));
-                        return;
-                    }
+                        return notifyFatalError(replaceCpy(_("Cannot find file %x."), L"%x", fmtPath(filePath)), _("Error"));
                 }
 
                 try
                 {
                     switch (getXmlType(filePath)) //throw FileError
                     {
-                        case XML_TYPE_GUI:
-                            configFiles.emplace_back(filePath, XML_TYPE_GUI);
+                        case XmlType::gui:
+                            configFiles.emplace_back(filePath, XmlType::gui);
                             break;
-                        case XML_TYPE_BATCH:
-                            configFiles.emplace_back(filePath, XML_TYPE_BATCH);
+                        case XmlType::batch:
+                            configFiles.emplace_back(filePath, XmlType::batch);
                             break;
-                        case XML_TYPE_GLOBAL:
+                        case XmlType::global:
                             globalConfigFile = filePath;
                             break;
-                        case XML_TYPE_OTHER:
-                            notifyFatalError(replaceCpy(_("File %x does not contain a valid configuration."), L"%x", fmtPath(filePath)), _("Error"));
-                            return;
+                        case XmlType::other:
+                            return notifyFatalError(replaceCpy(_("File %x does not contain a valid configuration."), L"%x", fmtPath(filePath)), _("Error"));
                     }
                 }
                 catch (const FileError& e)
                 {
-                    notifyFatalError(e.toString(), _("Error"));
-                    return;
+                    return notifyFatalError(e.toString(), _("Error"));
                 }
             }
-
-        if (dirPathPhrasesLeft.size() != dirPathPhrasesRight.size())
-        {
-            notifyFatalError(_("Unequal number of left and right directories specified."), _("Syntax error"));
-            return;
-        }
-
-        for (size_t i = 0; i < dirPathPhrasesLeft.size(); ++i)
-            dirPathPhrasePairs.emplace_back(dirPathPhrasesLeft[i], dirPathPhrasesRight[i]);
     }
     //----------------------------------------------------------------------------------------------------
 
@@ -328,7 +332,7 @@ void Application::launch(const std::vector<Zstring>& commandArgs)
     {
         return lpc != LocalPairConfig{ lpc.folderPathPhraseLeft,
                                        lpc.folderPathPhraseRight,
-                                       NoValue(), NoValue(), FilterConfig() };
+                                       std::nullopt, std::nullopt, FilterConfig() };
     };
 
     auto replaceDirectories = [&](MainConfiguration& mainCfg)
@@ -351,7 +355,7 @@ void Application::launch(const std::vector<Zstring>& commandArgs)
                 }
                 else
                     mainCfg.additionalPairs.push_back({ dirPathPhrasePairs[i].first, dirPathPhrasePairs[i].second,
-                                                        NoValue(), NoValue(), FilterConfig() });
+                                                        std::nullopt, std::nullopt, FilterConfig() });
         }
         return true;
     };
@@ -381,7 +385,7 @@ void Application::launch(const std::vector<Zstring>& commandArgs)
         const Zstring filepath = configFiles[0].first;
 
         //batch mode
-        if (configFiles[0].second == XML_TYPE_BATCH && !openForEdit)
+        if (configFiles[0].second == XmlType::batch && !openForEdit)
         {
             XmlBatchConfig batchCfg;
             try
@@ -394,8 +398,7 @@ void Application::launch(const std::vector<Zstring>& commandArgs)
             }
             catch (const FileError& e)
             {
-                notifyFatalError(e.toString(), _("Error"));
-                return;
+                return notifyFatalError(e.toString(), _("Error"));
             }
             if (!replaceDirectories(batchCfg.mainCfg))
                 return;
@@ -411,13 +414,12 @@ void Application::launch(const std::vector<Zstring>& commandArgs)
                 readAnyConfig({ filepath }, guiCfg, warningMsg); //throw FileError
 
                 if (!warningMsg.empty())
-                    showNotificationDialog(nullptr, DialogInfoType::WARNING, PopupDialogCfg().setDetailInstructions(warningMsg));
+                    showNotificationDialog(nullptr, DialogInfoType::warning, PopupDialogCfg().setDetailInstructions(warningMsg));
                 //what about simulating changed config on parsing errors?
             }
             catch (const FileError& e)
             {
-                notifyFatalError(e.toString(), _("Error"));
-                return;
+                return notifyFatalError(e.toString(), _("Error"));
             }
             if (!replaceDirectories(guiCfg.mainCfg))
                 return;
@@ -431,31 +433,27 @@ void Application::launch(const std::vector<Zstring>& commandArgs)
     else
     {
         if (!dirPathPhrasePairs.empty())
-        {
-            notifyFatalError(_("Directories cannot be set for more than one configuration file."), _("Syntax error"));
-            return;
-        }
+            return notifyFatalError(_("Directories cannot be set for more than one configuration file."), _("Syntax error"));
 
-        std::vector<Zstring> filepaths;
-        for (const auto& item : configFiles)
-            filepaths.push_back(item.first);
+        std::vector<Zstring> filePaths;
+        for (const auto& [filePath, xmlType] : configFiles)
+            filePaths.push_back(filePath);
 
         XmlGuiConfig guiCfg; //structure to receive gui settings with default values
         try
         {
             std::wstring warningMsg;
-            readAnyConfig(filepaths, guiCfg, warningMsg); //throw FileError
+            readAnyConfig(filePaths, guiCfg, warningMsg); //throw FileError
 
             if (!warningMsg.empty())
-                showNotificationDialog(nullptr, DialogInfoType::WARNING, PopupDialogCfg().setDetailInstructions(warningMsg));
+                showNotificationDialog(nullptr, DialogInfoType::warning, PopupDialogCfg().setDetailInstructions(warningMsg));
             //what about simulating changed config on parsing errors?
         }
         catch (const FileError& e)
         {
-            notifyFatalError(e.toString(), _("Error"));
-            return;
+            return notifyFatalError(e.toString(), _("Error"));
         }
-        runGuiMode(globalConfigFilePath, guiCfg, filepaths, !openForEdit /*startComparison*/);
+        runGuiMode(globalConfigFilePath, guiCfg, filePaths, !openForEdit /*startComparison*/);
     }
 }
 
@@ -474,38 +472,37 @@ void runGuiMode(const Zstring& globalConfigFilePath,
 
 void showSyntaxHelp()
 {
-    showNotificationDialog(nullptr, DialogInfoType::INFO, PopupDialogCfg().
+    showNotificationDialog(nullptr, DialogInfoType::info, PopupDialogCfg().
                            setTitle(_("Command line")).
                            setDetailInstructions(_("Syntax:") + L"\n\n" +
-                                                 L"./FreeFileSync " + L"\n" +
-                                                 L"    [" + _("config files:") + L" *.ffs_gui/*.ffs_batch]" + L"\n" +
-                                                 L"    [-DirPair " + _("directory") + L" " + _("directory") + L"]" + L"\n" +
-                                                 L"    [-Edit]" + L"\n" +
-                                                 L"    [" + _("global config file:") + L" GlobalSettings.xml]" + L"\n" +
-                                                 L"\n" +
+                                                 L"./FreeFileSync" + L'\n' +
+                                                 L"    [" + _("config files:") + L" *.ffs_gui/*.ffs_batch]" + L'\n' +
+                                                 L"    [-DirPair " + _("directory") + L' ' + _("directory") + L"]" L"\n" +
+                                                 L"    [-Edit]" + L'\n' +
+                                                 L"    [" + _("global config file:") + L" GlobalSettings.xml]" + L"\n\n" +
 
-                                                 _("config files:") + L"\n" +
-                                                 _("Any number of FreeFileSync .ffs_gui and/or .ffs_batch configuration files.") + L"\n\n" +
+                                                 _("config files:") + L'\n' +
+                                                 _("Any number of FreeFileSync \"ffs_gui\" and/or \"ffs_batch\" configuration files.") + L"\n\n" +
 
-                                                 L"-DirPair " + _("directory") + L" " + _("directory") + L"\n" +
+                                                 L"-DirPair " + _("directory") + L' ' + _("directory") + L'\n' +
                                                  _("Any number of alternative directory pairs for at most one config file.") + L"\n\n" +
 
-                                                 L"-Edit" + L"\n" +
-                                                 _("Open the selected configuration for editing only without executing it.") + L"\n\n" +
+                                                 L"-Edit" + '\n' +
+                                                 _("Open the selected configuration for editing only, without executing it.") + L"\n\n" +
 
-                                                 _("global config file:") + L"\n" +
+                                                 _("global config file:") + L'\n' +
                                                  _("Path to an alternate GlobalSettings.xml file.")));
 }
 
 
 void runBatchMode(const Zstring& globalConfigFilePath, const XmlBatchConfig& batchCfg, const Zstring& cfgFilePath, FfsReturnCode& returnCode)
 {
-    const bool showPopupAllowed = !batchCfg.mainCfg.ignoreErrors && batchCfg.batchExCfg.batchErrorDialog == BatchErrorDialog::SHOW;
+    const bool showPopupAllowed = !batchCfg.mainCfg.ignoreErrors && batchCfg.batchExCfg.batchErrorHandling == BatchErrorHandling::showPopup;
 
     auto notifyError = [&](const std::wstring& msg, FfsReturnCode rc)
     {
         if (showPopupAllowed)
-            showNotificationDialog(nullptr, DialogInfoType::ERROR2, PopupDialogCfg().setDetailInstructions(msg));
+            showNotificationDialog(nullptr, DialogInfoType::error, PopupDialogCfg().setDetailInstructions(msg));
         else //"exit" or "ignore"
             logFatalError(utfTo<std::string>(msg));
 
@@ -517,13 +514,19 @@ void runBatchMode(const Zstring& globalConfigFilePath, const XmlBatchConfig& bat
     {
         std::wstring warningMsg;
         readConfig(globalConfigFilePath, globalCfg, warningMsg); //throw FileError
-
         assert(warningMsg.empty()); //ignore parsing errors: should be migration problems only *cross-fingers*
     }
-    catch (const FileError& e)
+    catch (FileError&)
     {
-        if (!itemNotExisting(globalConfigFilePath)) //existing or access error
+        try
+        {
+            if (itemStillExists(globalConfigFilePath)) //throw FileError
+                throw;
+        }
+        catch (const FileError& e)
+        {
             return notifyError(e.toString(), FFS_RC_ABORTED); //abort sync!
+        }
     }
 
     try
@@ -532,7 +535,7 @@ void runBatchMode(const Zstring& globalConfigFilePath, const XmlBatchConfig& bat
     }
     catch (const FileError& e)
     {
-        notifyError(e.toString(), FFS_RC_FINISHED_WITH_WARNINGS);
+        notifyError(e.toString(), FFS_RC_WARNING);
         //continue!
     }
 
@@ -543,88 +546,103 @@ void runBatchMode(const Zstring& globalConfigFilePath, const XmlBatchConfig& bat
     //    checkForUpdatePeriodically(globalCfg.lastUpdateCheck);
     //WinInet not working when FFS is running as a service!!! https://support.microsoft.com/en-us/kb/238425
 
-    try //begin of synchronization process (all in one try-catch block)
+
+    std::set<AbstractPath> logFilePathsToKeep;
+    for (const ConfigFileItem& item : globalCfg.gui.mainDlg.cfgFileHistory)
+        logFilePathsToKeep.insert(item.logFilePath);
+
+    const std::chrono::system_clock::time_point syncStartTime = std::chrono::system_clock::now();
+
+    //class handling status updates and error messages
+    BatchStatusHandler statusHandler(!batchCfg.batchExCfg.runMinimized,
+                                     batchCfg.batchExCfg.autoCloseSummary,
+                                     extractJobName(cfgFilePath),
+                                     globalCfg.soundFileSyncFinished,
+                                     syncStartTime,
+                                     batchCfg.mainCfg.ignoreErrors,
+                                     batchCfg.batchExCfg.batchErrorHandling,
+                                     batchCfg.mainCfg.automaticRetryCount,
+                                     batchCfg.mainCfg.automaticRetryDelay,
+                                     batchCfg.batchExCfg.postSyncAction);
+    try
     {
-        const std::chrono::system_clock::time_point syncStartTime = std::chrono::system_clock::now();
-
-        //class handling status updates and error messages
-        BatchStatusHandler statusHandler(!batchCfg.batchExCfg.runMinimized, //throw AbortProcess, BatchRequestSwitchToMainDialog
-                                         batchCfg.batchExCfg.autoCloseSummary,
-                                         extractJobName(cfgFilePath),
-                                         globalCfg.soundFileSyncFinished,
-                                         syncStartTime,
-                                         batchCfg.batchExCfg.logFolderPathPhrase,
-                                         batchCfg.batchExCfg.logfilesCountLimit,
-                                         globalCfg.lastSyncsLogFileSizeMax,
-                                         batchCfg.mainCfg.ignoreErrors,
-                                         batchCfg.batchExCfg.batchErrorDialog,
-                                         batchCfg.mainCfg.automaticRetryCount,
-                                         batchCfg.mainCfg.automaticRetryDelay,
-                                         returnCode,
-                                         batchCfg.mainCfg.postSyncCommand,
-                                         batchCfg.mainCfg.postSyncCondition,
-                                         batchCfg.batchExCfg.postSyncAction);
-
-        logNonDefaultSettings(globalCfg, statusHandler); //inform about (important) non-default global settings
-
-        const std::vector<FolderPairCfg> fpCfgList = extractCompareCfg(batchCfg.mainCfg);
+        //inform about (important) non-default global settings
+        logNonDefaultSettings(globalCfg, statusHandler); //throw AbortProcess
 
         //batch mode: place directory locks on directories during both comparison AND synchronization
         std::unique_ptr<LockHolder> dirLocks;
-
-        const std::map<AbstractPath, size_t>& deviceParallelOps = batchCfg.mainCfg.deviceParallelOps;
 
         //COMPARE DIRECTORIES
         FolderComparison cmpResult = compare(globalCfg.warnDlgs,
                                              globalCfg.fileTimeTolerance,
                                              showPopupAllowed, //allowUserInteraction
                                              globalCfg.runWithBackgroundPriority,
-                                             globalCfg.folderAccessTimeout,
                                              globalCfg.createLockFile,
                                              dirLocks,
-                                             fpCfgList,
-                                             deviceParallelOps,
-                                             statusHandler); //throw X
-
+                                             extractCompareCfg(batchCfg.mainCfg),
+                                             statusHandler); //throw AbortProcess
         //START SYNCHRONIZATION
-        const std::vector<FolderPairSyncCfg> syncProcessCfg = extractSyncCfg(batchCfg.mainCfg);
-        if (syncProcessCfg.size() != cmpResult.size())
-            throw std::logic_error("Contract violation! " + std::string(__FILE__) + ":" + numberTo<std::string>(__LINE__));
-
-        synchronize(syncStartTime,
-                    globalCfg.verifyFileCopy,
-                    globalCfg.copyLockedFiles,
-                    globalCfg.copyFilePermissions,
-                    globalCfg.failSafeFileCopy,
-                    globalCfg.runWithBackgroundPriority,
-                    globalCfg.folderAccessTimeout,
-                    syncProcessCfg,
-                    cmpResult,
-                    deviceParallelOps,
-                    globalCfg.warnDlgs,
-                    statusHandler); //throw X
-
-        //not cancelled? => update last sync date for the selected cfg file
-        for (ConfigFileItem& cfi : globalCfg.gui.mainDlg.cfgFileHistory)
-            if (equalFilePath(cfi.filePath, cfgFilePath))
-            {
-                cfi.lastSyncTime = std::time(nullptr);
-                break;
-            }
+        if (!cmpResult.empty())
+            synchronize(syncStartTime,
+                        globalCfg.verifyFileCopy,
+                        globalCfg.copyLockedFiles,
+                        globalCfg.copyFilePermissions,
+                        globalCfg.failSafeFileCopy,
+                        globalCfg.runWithBackgroundPriority,
+                        extractSyncCfg(batchCfg.mainCfg),
+                        cmpResult,
+                        globalCfg.warnDlgs,
+                        statusHandler); //throw AbortProcess
     }
     catch (AbortProcess&) {} //exit used by statusHandler
-    catch (BatchRequestSwitchToMainDialog&)
-    {
-        //open new toplevel window *after* progress dialog is gone => run on main event loop
-        return MainDialog::create(globalConfigFilePath, &globalCfg, convertBatchToGui(batchCfg), { cfgFilePath }, true /*startComparison*/);
-    }
 
-    try //save global settings to XML: e.g. ignored warnings
+    BatchStatusHandler::Result r = statusHandler.reportResults(batchCfg.mainCfg.postSyncCommand, batchCfg.mainCfg.postSyncCondition,
+                                                               batchCfg.mainCfg.altLogFolderPathPhrase, globalCfg.logfilesMaxAgeDays, globalCfg.logFormat, logFilePathsToKeep,
+                                                               batchCfg.mainCfg.emailNotifyAddress, batchCfg.mainCfg.emailNotifyCondition); //noexcept
+    //----------------------------------------------------------------------
+
+    raiseReturnCode(returnCode, mapToReturnCode(r.resultStatus));
+
+    //update last sync stats for the selected cfg file
+    for (ConfigFileItem& cfi : globalCfg.gui.mainDlg.cfgFileHistory)
+        if (equalNativePath(cfi.cfgFilePath, cfgFilePath))
+        {
+            if (r.resultStatus != SyncResult::aborted)
+                cfi.lastSyncTime = std::chrono::system_clock::to_time_t(syncStartTime);
+            assert(!AFS::isNullPath(r.logFilePath));
+            if (!AFS::isNullPath(r.logFilePath))
+            {
+                cfi.logFilePath = r.logFilePath;
+                cfi.logResult   = r.resultStatus;
+            }
+            break;
+        }
+
+    //---------------------------------------------------------------------------
+    try //save global settings to XML: e.g. ignored warnings, last sync stats
     {
         writeConfig(globalCfg, globalConfigFilePath); //FileError
     }
     catch (const FileError& e)
     {
-        notifyError(e.toString(), FFS_RC_FINISHED_WITH_WARNINGS);
+        notifyError(e.toString(), FFS_RC_WARNING);
+    }
+
+    using FinalRequest = BatchStatusHandler::FinalRequest;
+    switch (r.finalRequest)
+    {
+        case FinalRequest::none:
+            break;
+        case FinalRequest::switchGui: //open new top-level window *after* progress dialog is gone => run on main event loop
+            MainDialog::create(globalConfigFilePath, &globalCfg, convertBatchToGui(batchCfg), { cfgFilePath }, true /*startComparison*/);
+            break;
+        case FinalRequest::shutdown: //run *after* last sync stats were updated and saved! https://freefilesync.org/forum/viewtopic.php?t=5761
+            try
+            {
+                shutdownSystem(); //throw FileError
+                terminateProcess(0 /*exitCode*/); //no point in continuing and saving cfg again in onQueryEndSession() while the OS will kill us anytime!
+            }
+            catch (const FileError& e) { notifyError(e.toString(), FFS_RC_WARNING); }
+            break;
     }
 }

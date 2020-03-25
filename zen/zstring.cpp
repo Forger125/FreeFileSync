@@ -50,7 +50,8 @@ Zstring getUnicodeNormalForm(const Zstring& str)
 {
     //fast pre-check:
     if (isAsciiString(str)) //perf: in the range of 3.5ns
-        return str; //god bless our ref-counting! => save output string memory consumption!
+        return str;
+    static_assert(std::is_same_v<decltype(str), const Zbase<Zchar>&>, "god bless our ref-counting! => save output string memory consumption!");
 
     //Example: const char* decomposed  = "\x6f\xcc\x81";
     //         const char* precomposed = "\xc3\xb3";
@@ -58,7 +59,7 @@ Zstring getUnicodeNormalForm(const Zstring& str)
     {
         gchar* outStr = ::g_utf8_normalize(str.c_str(), str.length(), G_NORMALIZE_DEFAULT_COMPOSE);
         if (!outStr)
-            throw SysError(L"g_utf8_normalize: conversion failed. (" + utfTo<std::wstring>(str) + L")");
+            throw SysError(L"g_utf8_normalize: conversion failed. (" + utfTo<std::wstring>(str) + L')');
         ZEN_ON_SCOPE_EXIT(::g_free(outStr));
         return outStr;
 

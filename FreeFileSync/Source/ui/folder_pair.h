@@ -17,7 +17,7 @@
 #include "small_dlgs.h"
 #include "sync_cfg.h"
 #include "../base/norm_filter.h"
-#include "../base/structures.h"
+#include "../base_tools.h"
 
 
 namespace fff
@@ -59,18 +59,18 @@ private:
 
         setImage(*basicPanel_.m_bpButtonLocalCompCfg, greyScaleIfDisabled(imgCmp_, !!localCmpCfg_));
         basicPanel_.m_bpButtonLocalCompCfg->SetToolTip(localCmpCfg_ ?
-                                                       _("Local comparison settings") +  L" (" + getVariantName(localCmpCfg_->compareVar) + L")" :
+                                                       _("Local comparison settings") +  L" (" + getVariantName(localCmpCfg_->compareVar) + L')' :
                                                        _("Local comparison settings"));
 
         setImage(*basicPanel_.m_bpButtonLocalSyncCfg, greyScaleIfDisabled(imgSync_, !!localSyncCfg_));
         basicPanel_.m_bpButtonLocalSyncCfg->SetToolTip(localSyncCfg_ ?
-                                                       _("Local synchronization settings") +  L" (" + getVariantName(localSyncCfg_->directionCfg.var) + L")" :
+                                                       _("Local synchronization settings") +  L" (" + getVariantName(localSyncCfg_->directionCfg.var) + L')' :
                                                        _("Local synchronization settings"));
 
         setImage(*basicPanel_.m_bpButtonLocalFilter, greyScaleIfDisabled(imgFilter_, !isNullFilter(localFilter_)));
         basicPanel_.m_bpButtonLocalFilter->SetToolTip(!isNullFilter(localFilter_) ?
-                                                      _("Local filter") + L" (" + _("Active") + L")" :
-                                                      _("Local filter") + L" (" + _("None") + L")");
+                                                      _("Local filter") + L" (" + _("Active") + L')' :
+                                                      _("Local filter") + L" (" + _("None")   + L')');
     }
 
     void OnLocalCompCfgContext(wxCommandEvent& event)

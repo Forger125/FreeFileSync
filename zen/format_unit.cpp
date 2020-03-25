@@ -11,6 +11,7 @@
 #include "i18n.h"
 #include "time.h"
 #include "globals.h"
+#include "utf.h"
 
     #include <clocale> //thousands separator
     #include "utf.h"   //
@@ -115,7 +116,7 @@ std::wstring roundToBlock(double timeInHigh,
 
     std::wstring output = formatUnitTime(roundedtimeInLow / unitLowPerHigh, unitHigh);
     if (unitLowPerHigh > blockSizeLow)
-        output += L" " + formatUnitTime(roundedtimeInLow % unitLowPerHigh, unitLow);
+        output += L' ' + formatUnitTime(roundedtimeInLow % unitLowPerHigh, unitLow);
     return output;
 }
 }
@@ -190,11 +191,11 @@ std::wstring zen::formatNumber(int64_t n)
 
 std::wstring zen::formatUtcToLocalTime(time_t utcTime)
 {
-    auto errorMsg = [&] { return _("Error") + L" (time_t: " + numberTo<std::wstring>(utcTime) + L")"; };
+    auto errorMsg = [&] { return _("Error") + L" (time_t: " + numberTo<std::wstring>(utcTime) + L')'; };
 
     TimeComp loc = getLocalTime(utcTime);
 
-    std::wstring dateString = formatTime<std::wstring>(L"%x  %X", loc);
+    std::wstring dateString = utfTo<std::wstring>(formatTime(Zstr("%x  %X"), loc));
     return !dateString.empty() ? dateString : errorMsg();
 }
 

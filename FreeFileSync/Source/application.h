@@ -10,7 +10,7 @@
 #include <vector>
 #include <zen/zstring.h>
 #include <wx/app.h>
-#include "lib/return_codes.h"
+#include "return_codes.h"
 
 
 namespace fff //avoid name clash with "int ffs()" for fuck's sake! (maxOS, Linux issue only: <string> internally includes <strings.h>, WTF!)
@@ -19,11 +19,11 @@ class Application : public wxApp
 {
 private:
     bool OnInit() override;
-    int  OnRun() override;
+    int  OnRun () override;
     int  OnExit() override;
     bool OnExceptionInMainLoop() override { throw; } //just re-throw and avoid display of additional messagebox: it will be caught in OnRun()
     void OnUnhandledException () override { throw; } //just re-throw and avoid display of additional messagebox
-
+    wxLayoutDirection GetLayoutDirection() const override;
     void onEnterEventLoop(wxEvent& event);
     void onQueryEndSession(wxEvent& event);
     void launch(const std::vector<Zstring>& commandArgs);

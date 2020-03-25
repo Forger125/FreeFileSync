@@ -18,7 +18,7 @@ using namespace zen;
     #error FFS, we are royally screwed!
 #endif
 
-static_assert(OPENSSL_VERSION_NUMBER >= 0x10100000L, "OpenSSL version too old");
+static_assert(OPENSSL_VERSION_NUMBER >= 0x1010105fL, "OpenSSL version too old");
 
 
 void zen::openSslInit()
@@ -68,7 +68,7 @@ std::wstring formatOpenSSLError(const std::wstring& functionName, unsigned long 
 
 std::wstring formatLastOpenSSLError(const std::wstring& functionName)
 {
-    const unsigned long ec = ::ERR_peek_last_error();
+    const auto ec = ::ERR_peek_last_error();
     ::ERR_clear_error(); //clean up for next OpenSSL operation on this thread
     return formatOpenSSLError(functionName, ec);
 }
@@ -322,8 +322,8 @@ std::string createSignature(const std::string& message, EVP_PKEY* privateKey) //
                               reinterpret_cast<unsigned char*>(&signature[0]), //unsigned char* sigret,
                               &sigLen) != 1)                                   //size_t* siglen
         throw SysError(formatLastOpenSSLError(L"EVP_DigestSignFinal"));
-    signature.resize(sigLen);
 
+    signature.resize(sigLen);
     return signature;
 }
 
@@ -373,7 +373,7 @@ void zen::verifySignature(const std::string& message, const std::string& signatu
 
 namespace
 {
-std::wstring formatSslErrorRaw(int ec)
+std::wstring formatSslErrorCode(int ec)
 {
     switch (ec)
     {
@@ -388,12 +388,15 @@ std::wstring formatSslErrorRaw(int ec)
             ZEN_CHECK_CASE_FOR_CONSTANT(SSL_ERROR_WANT_ACCEPT);
             ZEN_CHECK_CASE_FOR_CONSTANT(SSL_ERROR_WANT_ASYNC);
             ZEN_CHECK_CASE_FOR_CONSTANT(SSL_ERROR_WANT_ASYNC_JOB);
+            ZEN_CHECK_CASE_FOR_CONSTANT(SSL_ERROR_WANT_CLIENT_HELLO_CB);
+
+        default:
+            return replaceCpy<std::wstring>(L"SSL error %x", L"%x", numberTo<std::wstring>(ec));
     }
-    return L"Unknown SSL error: " + numberTo<std::wstring>(ec);
 }
 
 
-std::wstring formatX509ErrorRaw(long ec)
+std::wstring formatX509ErrorCode(long ec)
 {
     switch (ec)
     {
@@ -473,8 +476,10 @@ std::wstring formatX509ErrorRaw(long ec)
             ZEN_CHECK_CASE_FOR_CONSTANT(X509_V_ERR_OCSP_VERIFY_NEEDED);
             ZEN_CHECK_CASE_FOR_CONSTANT(X509_V_ERR_OCSP_VERIFY_FAILED);
             ZEN_CHECK_CASE_FOR_CONSTANT(X509_V_ERR_OCSP_CERT_UNKNOWN);
+
+        default:
+            return replaceCpy<std::wstring>(L"X509 error %x", L"%x", numberTo<std::wstring>(ec));
     }
-    return L"Unknown X509 error: " + numberTo<std::wstring>(ec);
 }
 }
 
@@ -487,7 +492,7 @@ public:
     {
         ZEN_ON_SCOPE_FAIL(cleanup(); /*destructor call would lead to member double clean-up!!!*/);
 
-        ctx_ = ::SSL_CTX_new(TLS_client_method());
+        ctx_ = ::SSL_CTX_new(::TLS_client_method());
         if (!ctx_)
             throw SysError(formatLastOpenSSLError(L"SSL_CTX_new"));
 
@@ -526,13 +531,13 @@ public:
 
         const int rv = ::SSL_connect(ssl_); //implicitly calls SSL_set_connect_state()
         if (rv != 1)
-            throw SysError(formatLastOpenSSLError(L"SSL_connect") + L" " + formatSslErrorRaw(::SSL_get_error(ssl_, rv)));
+            throw SysError(formatLastOpenSSLError(L"SSL_connect") + L' ' + formatSslErrorCode(::SSL_get_error(ssl_, rv)));
 
         if (caCertFilePath)
         {
             const long verifyResult = ::SSL_get_verify_result(ssl_);
             if (verifyResult != X509_V_OK)
-                throw SysError(formatSystemError(L"SSL_get_verify_result", formatX509ErrorRaw(verifyResult), L""));
+                throw SysError(formatSystemError(L"SSL_get_verify_result", formatX509ErrorCode(verifyResult), L""));
         }
     }
 
@@ -554,17 +559,24 @@ public:
     size_t tryRead(void* buffer, size_t bytesToRead) //throw SysError; may return short, only 0 means EOF!
     {
         if (bytesToRead == 0) //"read() with a count of 0 returns zero" => indistinguishable from end of file! => check!
-            throw std::logic_error("Contract violation! " + std::string(__FILE__) + ":" + numberTo<std::string>(__LINE__));
+            throw std::logic_error("Contract violation! " + std::string(__FILE__) + ':' + numberTo<std::string>(__LINE__));
 
         size_t bytesReceived = 0;
         const int rv = ::SSL_read_ex(ssl_, buffer, bytesToRead, &bytesReceived);
         if (rv != 1)
         {
             const int sslError = ::SSL_get_error(ssl_, rv);
-            if (sslError == SSL_ERROR_ZERO_RETURN || //EOF + close_notify alert
-                (sslError == SSL_ERROR_SYSCALL && ::ERR_peek_last_error() == 0)) //EOF: only expected for HTTP/1.0
+            if (sslError == SSL_ERROR_ZERO_RETURN)
+                return 0; //EOF + close_notify alert
+
+            warn_static("find a better solution for SSL_read_ex + EOF")
+            //"sslError == SSL_ERROR_SYSCALL && ::ERR_peek_last_error() == 0" => obsolete as of OpenSSL 1.1.1e
+            //https://github.com/openssl/openssl/issues/10880#issuecomment-575746226
+            const auto ec = ::ERR_peek_last_error();
+            if (sslError == SSL_ERROR_SSL && ERR_GET_REASON(ec) == SSL_R_UNEXPECTED_EOF_WHILE_READING) //EOF: only expected for HTTP/1.0
                 return 0;
-            throw SysError(formatLastOpenSSLError(L"SSL_read_ex") + L" " + formatSslErrorRaw(sslError));
+
+            throw SysError(formatLastOpenSSLError(L"SSL_read_ex") + L' ' + formatSslErrorCode(sslError));
         }
         assert(bytesReceived > 0); //SSL_read_ex() considers EOF an error!
         if (bytesReceived > bytesToRead) //better safe than sorry
@@ -576,12 +588,12 @@ public:
     size_t tryWrite(const void* buffer, size_t bytesToWrite) //throw SysError; may return short! CONTRACT: bytesToWrite > 0
     {
         if (bytesToWrite == 0)
-            throw std::logic_error("Contract violation! " + std::string(__FILE__) + ":" + numberTo<std::string>(__LINE__));
+            throw std::logic_error("Contract violation! " + std::string(__FILE__) + ':' + numberTo<std::string>(__LINE__));
 
         size_t bytesWritten = 0;
         const int rv = ::SSL_write_ex(ssl_, buffer, bytesToWrite, &bytesWritten);
         if (rv != 1)
-            throw SysError(formatLastOpenSSLError(L"SSL_write_ex") + L" " + formatSslErrorRaw(::SSL_get_error(ssl_, rv)));
+            throw SysError(formatLastOpenSSLError(L"SSL_write_ex") + L' ' + formatSslErrorCode(::SSL_get_error(ssl_, rv)));
 
         if (bytesWritten > bytesToWrite)
             throw SysError(L"SSL_write_ex: buffer overflow.");
