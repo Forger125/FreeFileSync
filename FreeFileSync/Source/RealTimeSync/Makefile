@@ -41,6 +41,7 @@ cppFiles+=../../../wx+/image_tools.cpp
 cppFiles+=../../../wx+/image_resources.cpp
 cppFiles+=../../../wx+/popup_dlg.cpp
 cppFiles+=../../../wx+/popup_dlg_generated.cpp
+cppFiles+=../../../wx+/taskbar.cpp
 cppFiles+=../../../xBRZ/src/xbrz.cpp
 
 tmpPath = /tmp/$(exeName)_Make

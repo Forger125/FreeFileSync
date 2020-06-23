@@ -116,11 +116,11 @@ std::wstring zen::getOsDescription() //throw FileError
         trim(osName,    true, true, [](char c) { return c == '"' || c == '\''; });
         trim(osVersion, true, true, [](char c) { return c == '"' || c == '\''; });
 
-        if (osName   .empty()) throw SysError(formatSystemError("/etc/os-release", L"", L"NAME missing."));
-        if (osVersion.empty()) throw SysError(formatSystemError("/etc/os-release", L"", L"VERSION_ID missing."));
-
+        if (osName.empty()) throw SysError(formatSystemError("/etc/os-release", L"", L"NAME missing."));
+        //VERSION_ID usually available, except for Arch Linux: https://freefilesync.org/forum/viewtopic.php?t=7276
         //PRETTY_NAME? too wordy! e.g. "Fedora 17 (Beefy Miracle)"
-        return utfTo<std::wstring>(osName + ' ' + osVersion); //e.g. "CentOS Linux 7"
+
+        return utfTo<std::wstring>(trimCpy(osName + ' ' + osVersion)); //e.g. "CentOS Linux 7"
 
     }
     catch (const SysError& e) { throw FileError(_("Cannot get process information."), e.toString()); }
